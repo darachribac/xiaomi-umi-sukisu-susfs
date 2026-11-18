@@ -40,7 +40,10 @@ on:
 jobs:
   build-kernel:
     name: Build ${{ github.event.inputs.device }} | KSU:${{ github.event.inputs.ksu }} | OS:${{ github.event.inputs.target_os }}
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: the prebuilt ld.lld in the ZyC Clang toolchain
+    # was linked against libxml2.so.2, which was removed in Ubuntu 26.04.
+    # Pinning avoids the "libxml2.so.2: cannot open shared object file" error.
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout Repository
@@ -56,6 +59,22 @@ jobs:
           lib32readline-dev lib32z1-dev lz4 \
           libsdl1.2-dev libssl-dev libxml2-dev libxml2-utils lzop pngcrush rsync \
           schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+
+        # Safety net: if a future runner image replaces libxml2.so.2 with a
+        # versioned soname (e.g. libxml2.so.16), create a compat symlink so
+        # the prebuilt ld.lld from the Clang toolchain can still start.
+        if [ ! -e /usr/lib/x86_64-linux-gnu/libxml2.so.2 ]; then
+          NEW_LIB=$(ls /usr/lib/x86_64-linux-gnu/libxml2.so.* 2>/dev/null | head -n1 || true)
+          if [ -n "$NEW_LIB" ]; then
+            echo "[*] Creating libxml2.so.2 -> $(basename "$NEW_LIB") symlink"
+            sudo ln -sf "$NEW_LIB" /usr/lib/x86_64-linux-gnu/libxml2.so.2
+            sudo ldconfig
+          else
+            echo "[!] Warning: no libxml2 shared library found; ld.lld may fail."
+          fi
+        else
+          echo "[*] libxml2.so.2 already present — no symlink needed."
+        fi
 
     - name: Cache ccache
       uses: actions/cache@v4
@@ -73,7 +92,21 @@ jobs:
         wget -q https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz
         tar -zxvf Clang-16.0.6-20260807.tar.gz
 
+    - name: Verify Toolchain
+      run: |
+        export PATH="$HOME/zyc-clang/bin:$PATH"
+        echo "[*] clang version:"
+        clang --version
+        echo "[*] ld.lld version:"
+        ld.lld --version || echo "[!] ld.lld failed to start"
+
     - name: Run Build Script
+      env:
+        # Required so build_kernel.sh can clone AnyKernel3 non-interactively
+        # (prevents "could not read Username for 'https://github.com'" error).
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Force git to fail fast instead of prompting if a clone is rejected.
+        GIT_TERMINAL_PROMPT: '0'
       run: |
         chmod +x build_kernel.sh
 
@@ -91,8 +124,10 @@ jobs:
         ./build_kernel.sh $ARGS
 
     - name: Upload Flashable ZIP
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: APTKernel-${{ github.event.inputs.device }}-${{ github.event.inputs.target_os }}-${{ github.run_id }}
         path: APTKernel_*.zip
+        if-no-files-found: error
         compression-level: 0
