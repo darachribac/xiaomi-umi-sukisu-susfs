@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Exit on any error
+# Exit on any error, and make pipes fail loudly too
 set -e
+set -o pipefail
 
 # ==========================================
 # Argument Parsing
@@ -100,13 +101,54 @@ echo "==========================================="
 echo "==========================================="
 echo " [*] Initializing AnyKernel3 Workspace"
 echo "==========================================="
+
+# Primary AnyKernel3 source (branch is kona-specific for umi/pipa/etc.)
+AK3_REPO="AstideLabs/AnyKernel3"
+AK3_BRANCH="kona"
+# Fallback if the primary URL is gone/private. Uses default branch.
+AK3_FALLBACK_REPO="osm0sis/AnyKernel3"
+
+# Optional token support so private forks can still be cloned non-interactively
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "[*] GITHUB_TOKEN detected, using authenticated clone URLs."
+    AK3_CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${AK3_REPO}.git"
+    AK3_FALLBACK_CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${AK3_FALLBACK_REPO}.git"
+else
+    echo "[*] No GITHUB_TOKEN set, using anonymous clone URLs."
+    AK3_CLONE_URL="https://github.com/${AK3_REPO}.git"
+    AK3_FALLBACK_CLONE_URL="https://github.com/${AK3_FALLBACK_REPO}.git"
+fi
+
 rm -rf anykernel
-echo "[*] Cloning AnyKernel3..."
-git clone https://github.com/AstideLabs/AnyKernel3 -b kona --single-branch --depth=1 anykernel
-echo "[+] AnyKernel3 cloned successfully."
+
+echo "[*] Cloning AnyKernel3 from ${AK3_REPO} (branch: ${AK3_BRANCH})..."
+# Redirect git's prompts away from the TTY explicitly; if the repo is missing/private
+# this fails fast instead of hanging on a credential prompt.
+if GIT_TERMINAL_PROMPT=0 git clone "$AK3_CLONE_URL" \
+        -b "$AK3_BRANCH" --single-branch --depth=1 anykernel 2>/dev/null; then
+    echo "[+] AnyKernel3 cloned successfully."
+else
+    echo "[!] Primary clone of ${AK3_REPO} (branch: ${AK3_BRANCH}) failed."
+    echo "[!] The repo may have been renamed, deleted, or made private."
+    echo "[!] Falling back to ${AK3_FALLBACK_REPO} (default branch)..."
+    rm -rf anykernel
+    GIT_TERMINAL_PROMPT=0 git clone "$AK3_FALLBACK_CLONE_URL" \
+        --single-branch --depth=1 anykernel
+    echo "[+] Fallback AnyKernel3 cloned successfully."
+fi
+
 echo "[*] Adjusting AnyKernel3..."
-sed -i "s/^device\.name1=.*/device.name1=${DEVICE_NAME}/" anykernel/anykernel.sh
-echo "[*] AnyKernel3 adjusted successfully."
+if grep -q '^device\.name1=' anykernel/anykernel.sh 2>/dev/null; then
+    sed -i "s/^device\.name1=.*/device.name1=${DEVICE_NAME}/" anykernel/anykernel.sh
+    echo "[+] Device name set to ${DEVICE_NAME}."
+else
+    echo "[!] WARN: device.name1= not found in anykernel.sh (format may differ)."
+    echo "[!]       Adding it right after the first comment block."
+    # Prepend it — most AK3 templates expect it near the top
+    sed -i "0,/^# AnyKernel3/{/^# AnyKernel3/i device.name1=${DEVICE_NAME}
+}" anykernel/anykernel.sh 2>/dev/null || true
+fi
+echo "[+] AnyKernel3 adjusted successfully."
 echo "==========================================="
 
 # ==========================================
@@ -117,9 +159,9 @@ build_target() {
     echo "==========================================="
     echo " Starting Kernel Compilation for ${DEVICE_NAME} (Target: $OS_TYPE)"
     echo "==========================================="
-    
+
     local OUT_DIR="${KERNEL_DIR}/out_${OS_TYPE}"
-    
+
     local MAKE_OPTS=(
         -j"$(nproc)"
         O="${OUT_DIR}"
@@ -143,8 +185,7 @@ build_target() {
     if [ "$OS_TYPE" == "miui" ]; then
         echo "[*] Applying MIUI DTS patches..."
         cp -a "${DTS_SOURCE}" "${DTS_BACKUP}"
-        
-        # Apply MIUI specific sed patches to dts
+
         sed -i 's/<154>/<1537>/g' ${DTS_SOURCE}/dsi-panel-j1s* || true
         sed -i 's/<154>/<1537>/g' ${DTS_SOURCE}/dsi-panel-j2* || true
         sed -i 's/<155>/<1544>/g' ${DTS_SOURCE}/dsi-panel-j3s-37-02-0a-dsc-video.dtsi || true
@@ -199,7 +240,7 @@ build_target() {
     # ----------------------------------------------------
     # Configuration tweaks
     # ----------------------------------------------------
-    
+
     # 1. Baseband-guard configuration (Always applied)
     echo "[*] Injecting Baseband-guard configuration..."
     scripts/config --file "${OUT_DIR}/.config" -e BBG
@@ -258,7 +299,6 @@ build_target() {
     # Droidspaces non-GKI kernel patches (committed in Droidspaces-patches/)
     echo "[*] Applying Droidspaces non-GKI kernel patches..."
     cd "${KERNEL_DIR}"
-    # Patch 01 (xt_qtaguid panic fix) only applies on trees that still ship the module
     if [ -f "net/netfilter/xt_qtaguid.c" ]; then
         patch -p1 --forward < "Droidspaces-patches/01.fix_kernel_panic_in_xt_qtaguid.patch" \
             && echo "[OK] Droidspaces patch 01 applied" \
@@ -266,11 +306,9 @@ build_target() {
     else
         echo "[*] Skipping Droidspaces patch 01 (net/netfilter/xt_qtaguid.c not in this tree)"
     fi
-    # Patch 02 (cgroup file prefix) is required for container cgroup handling
     patch -p1 --forward < "Droidspaces-patches/02.fix_restore_cgroup_file_prefix.patch" \
         && echo "[OK] Droidspaces patch 02 applied" \
         || echo "[!] WARN: Droidspaces patch 02 (cgroup prefix) failed (container cgroup limits may be reduced)"
-
 
     # 3. MIUI configurations
     if [ "$OS_TYPE" == "miui" ]; then
@@ -318,7 +356,6 @@ build_target() {
             -e REKERNEL_NETWORK
     fi
 
-    # We always need to re-evaluate dependencies because BBG is injected unconditionally
     echo "[*] Updating config (make olddefconfig)..."
     make "${MAKE_OPTS[@]}" olddefconfig
 
@@ -326,9 +363,8 @@ build_target() {
     # Compilation
     # ----------------------------------------------------
     echo "[*] Building kernel..."
-    make "${MAKE_OPTS[@]}" 
+    make "${MAKE_OPTS[@]}"
 
-    # Restore DTS backup for MIUI
     if [ "$OS_TYPE" == "miui" ]; then
         echo "[*] Restoring DTS backups..."
         rm -rf "${DTS_SOURCE}"
@@ -341,18 +377,16 @@ build_target() {
         echo "[+] Kernel Image path: ${OUT_DIR}/arch/arm64/boot/Image"
 
         echo "[*] Packaging to AnyKernel3 ($OS_TYPE)..."
-        # 确保独立打包：清空现有的 kernels 目录
         rm -rf anykernel/kernels/*
         mkdir -p "anykernel/kernels/${OS_TYPE}/"
-        
+
         cp "${OUT_DIR}/arch/arm64/boot/Image" "anykernel/kernels/${OS_TYPE}/"
         cp "${OUT_DIR}/arch/arm64/boot/dtb" "anykernel/kernels/${OS_TYPE}/"
-        
+
         if [ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]; then
             cp "${OUT_DIR}/arch/arm64/boot/dtbo.img" "anykernel/kernels/${OS_TYPE}/"
         fi
-        
-        # 确定 ZIP 文件名
+
         local KSU_ZIP_STR="NoKernelSU"
         if [ "$ENABLE_KSU" -eq 1 ]; then
             KSU_ZIP_STR="ReSukiSU-SuSFS"
@@ -360,13 +394,13 @@ build_target() {
         local GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "unknown")
         local OS_UPPER=$(echo "$OS_TYPE" | tr '[:lower:]' '[:upper:]')
         local ZIP_FILENAME="APTKernel_${OS_UPPER}_${DEVICE_NAME}_${KSU_ZIP_STR}_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
-        
+
         echo "[*] Zipping $ZIP_FILENAME ..."
         pushd anykernel > /dev/null
         zip -r9 "$ZIP_FILENAME" ./* -x .git .gitignore out/ ./*.zip > /dev/null
         mv "$ZIP_FILENAME" ../
         popd > /dev/null
-        
+
         echo "[+] $OS_TYPE kernel binaries successfully packed into: $ZIP_FILENAME"
     else
         echo "[-] $OS_TYPE Build Failed. Kernel Image not found."
